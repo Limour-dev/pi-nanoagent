@@ -29,13 +29,11 @@ const KILL_GRACE_MS = 5_000;
 // System-prompt surface (kept deliberately small)
 // ---------------------------------------------------------------------------
 
-const DESCRIPTION = `Run one self-contained task in a fresh, isolated pi subagent ("nano agent"). The subagent starts with an empty context, has no skills and no extensions, and can only run bash — so give it the full task in prompt and it must work through the shell. Up to ${MAX_PARALLEL} nano_agent calls run in parallel: for independent tasks, emit several calls in one message instead of chaining them. Returns the subagent's final stdout.`;
+const DESCRIPTION = `Run one self-contained task in a fresh, isolated pi subagent ("nano agent"): empty context, no skills, no extensions, and only the bash tool. Give it the full task in prompt — it cannot read files except through the shell. Independent tasks may be dispatched in parallel. Returns the subagent's stdout.`;
 
-const PROMPT_SNIPPET = `Delegate a bash-only task to an isolated subagent (up to ${MAX_PARALLEL} in parallel)`;
+const PROMPT_SNIPPET = "Delegate a self-contained task to a fresh bash-only subagent";
 
-const PROMPT_GUIDELINES = [
-	`Use ${TOOL_NAME} to delegate a self-contained task to a fresh subagent that only has bash; at most ${MAX_PARALLEL} ${TOOL_NAME} calls run at once, so batch independent tasks into one message.`,
-];
+const PROMPT_GUIDELINES = [`Use ${TOOL_NAME} when a task is self-contained and solvable in the shell.`];
 
 // ---------------------------------------------------------------------------
 // Parameter schema & types

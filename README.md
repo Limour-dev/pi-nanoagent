@@ -80,8 +80,9 @@ also removes the call from the queue.
 
 ## System-prompt footprint
 
-The whole injected surface is one description, one `Available tools` snippet and
-one guideline bullet, all mentioning the 4-way parallelism. Output is capped at
+The whole injected surface is one short description, one `Available tools`
+snippet and one guideline bullet — parallelism is mentioned once, as a hint,
+not a hard limit. Output is capped at
 50 KB (tail-biased) so a chatty subagent cannot flood the parent context.
 
 ## Limitations
