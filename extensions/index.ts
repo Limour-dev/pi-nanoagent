@@ -8,9 +8,9 @@
  *
  * That is: no skills, no extensions (this plugin included), and exactly one
  * tool — `bash`. The child inherits the dispatching session's cwd, model and
- * thinking level, and is killed when the parent turn is aborted. The pi
- * executable is discovered defensively (hosts such as pi-web run pi in-process,
- * so `process.argv[1]` there is not the CLI); `PI_CLI` overrides the search.
+ * thinking level, and is killed when the parent turn is aborted. The CLI is
+ * found via `PI_CLI` or as `pi` on PATH — never via `process.argv[1]`, which is
+ * the host's script when pi runs in-process (pi-web).
  *
  * At most 4 children run at the same time; extra calls queue until a slot is
  * free. No dependencies beyond what Pi already provides.
@@ -26,7 +26,6 @@ const MAX_PARALLEL = 4;
 const OUTPUT_LIMIT = 50 * 1024; // stdout kept for the model, tail-biased
 const STDERR_LIMIT = 8 * 1024;
 const KILL_GRACE_MS = 5_000;
-const PROBE_TIMEOUT_MS = 20_000;
 
 // ---------------------------------------------------------------------------
 // System-prompt surface (kept deliberately small)
@@ -101,19 +100,8 @@ function releaseSlot(): void {
 // Child process invocation
 // ---------------------------------------------------------------------------
 
-interface Invocation {
-	command: string;
-	args: string[];
-}
-
-interface Candidate {
-	inv: Invocation;
-	/** Known to be the pi CLI, so it wins without being executed. */
-	trusted: boolean;
-}
-
 const PI_CLI_MARKER = "pi-coding-agent";
-const PI_HELP_FLAGS = ["--append-system-prompt", "--no-prompt-templates", "--thinking"];
+const PI_BIN_NAMES = process.platform === "win32" ? ["pi.cmd", "pi.exe", "pi"] : ["pi"];
 
 function realpathOf(p: string): string {
 	try {
@@ -123,92 +111,43 @@ function realpathOf(p: string): string {
 	}
 }
 
-function findOnPath(name: string): string | undefined {
-	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
-		if (!dir) continue;
-		const full = path.join(dir, name);
-		try {
-			fs.accessSync(full, fs.constants.X_OK);
-			return full;
-		} catch {
-			// keep looking
-		}
+function isExecutable(p: string): boolean {
+	try {
+		fs.accessSync(p, fs.constants.X_OK);
+		return fs.statSync(p).isFile();
+	} catch {
+		return false;
 	}
-	return undefined;
 }
 
-// The parent process is NOT always the pi CLI: hosts such as pi-web run pi
-// in-process, so argv[1] there is Next.js' own bin (which has its own -p, --port).
-// Candidates in a known pi layout are accepted as-is; anything else must prove
-// itself via `--help` before we are willing to execute it.
-function candidates(): Candidate[] {
-	const list: Candidate[] = [];
-	const push = (command: string, args: string[], trusted: boolean) => list.push({ inv: { command, args }, trusted });
+/*
+ * Deliberately dumb: PI_CLI, else `pi` on PATH. Nothing is ever executed to
+ * find out whether a candidate is really pi, because the parent process is not
+ * necessarily the CLI at all — hosts like pi-web run pi in-process, where
+ * process.argv[1] is Next.js' own bin (which also takes `-p, --port`).
+ */
+let piCli: string | undefined;
+
+function resolvePiCli(): string {
+	if (piCli) return piCli;
 
 	const override = process.env.PI_CLI?.trim();
-	if (override) push(override, [], true); // explicit user choice
+	if (override) return (piCli = override);
 
-	const currentScript = process.argv[1];
-	if (currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)) {
-		push(process.execPath, [currentScript], realpathOf(currentScript).includes(PI_CLI_MARKER));
+	const found: string[] = [];
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		for (const name of PI_BIN_NAMES) {
+			const full = path.join(dir, name);
+			if (isExecutable(full)) found.push(full);
+		}
 	}
 
-	// A standalone (bun-compiled) pi binary is its own executable.
-	if (!/^(node|bun)(\.exe)?$/.test(path.basename(process.execPath).toLowerCase())) {
-		push(process.execPath, [], realpathOf(process.execPath).includes(PI_CLI_MARKER));
-	}
+	// A PATH may hold an unrelated `pi`, so prefer a real pi package layout.
+	const best = found.find((p) => realpathOf(p).includes(PI_CLI_MARKER)) ?? found[0];
+	if (best) return (piCli = best);
 
-	const onPath = findOnPath("pi");
-	if (onPath) push(onPath, [], realpathOf(onPath).includes(PI_CLI_MARKER));
-	return list;
-}
-
-/** The pi CLI's `--help` is the only one carrying all of these flags. */
-async function isPiCli(inv: Invocation): Promise<boolean> {
-	return await new Promise<boolean>((resolve) => {
-		let out = "";
-		let settled = false;
-		let timer: NodeJS.Timeout | undefined;
-		const finish = (ok: boolean) => {
-			if (settled) return;
-			settled = true;
-			if (timer) clearTimeout(timer);
-			resolve(ok);
-		};
-
-		const proc = spawn(inv.command, [...inv.args, "--help"], { stdio: ["ignore", "pipe", "ignore"], shell: false });
-		timer = setTimeout(() => {
-			proc.kill("SIGKILL");
-			finish(false);
-		}, PROBE_TIMEOUT_MS);
-		timer.unref?.();
-
-		proc.stdout?.setEncoding("utf-8");
-		proc.stdout?.on("data", (chunk: string) => {
-			out += chunk;
-		});
-		proc.on("error", () => finish(false));
-		proc.on("close", () => finish(PI_HELP_FLAGS.every((flag) => out.includes(flag))));
-	});
-}
-
-let invocationPromise: Promise<Invocation> | undefined;
-
-/** Resolved once per pi process, then reused by concurrent calls. */
-function resolveInvocation(): Promise<Invocation> {
-	invocationPromise ??= (async () => {
-		const list = candidates();
-		for (const { inv, trusted } of list) {
-			if (trusted) return inv;
-		}
-		for (const { inv } of list) {
-			if (await isPiCli(inv)) return inv;
-		}
-		throw new Error(
-			`could not find the pi CLI (tried: ${list.map((c) => c.inv.command).join(", ") || "nothing"}). Set PI_CLI to the pi executable.`,
-		);
-	})();
-	return invocationPromise;
+	throw new Error("could not find the pi CLI on PATH. Set PI_CLI to the pi executable.");
 }
 
 function buildArgs(ctx: ExtensionContext, prompt: string): string[] {
@@ -247,7 +186,7 @@ async function runNanoAgent(
 	prompt: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ text: string; details: NanoDetails }> {
-	const invocation = await resolveInvocation();
+	const command = resolvePiCli();
 	const args = buildArgs(ctx, prompt);
 	const cwd = ctx.cwd;
 	const startedAt = Date.now();
@@ -255,11 +194,12 @@ async function runNanoAgent(
 	let stdout = "";
 	let stderr = "";
 	let aborted = false;
+	let spawnFailed = false;
 	let killTimer: NodeJS.Timeout | undefined;
 
 	const result = await new Promise<{ code: number | null; sig: NodeJS.Signals | null; aborted: boolean }>(
 		(resolve) => {
-			const proc = spawn(invocation.command, [...invocation.args, ...args], {
+			const proc = spawn(command, args, {
 				cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"], // stdin ignored: never merge piped stdin
@@ -295,6 +235,7 @@ async function runNanoAgent(
 			};
 
 			proc.on("error", (err) => {
+				spawnFailed = true;
 				stderr = `${stderr}\nspawn failed: ${err.message}`;
 				// ENOENT never reaches `close` on some platforms: settle on the next tick.
 				if (proc.pid === undefined) setImmediate(() => settle(null, null));
@@ -306,7 +247,7 @@ async function runNanoAgent(
 	const out = tail(stdout.trim(), OUTPUT_LIMIT);
 	const details: NanoDetails = {
 		// Drop `--` and the (possibly huge) prompt: show it as `<prompt>` instead.
-		command: `${[invocation.command, ...invocation.args, ...args.slice(0, -2)].join(" ")} -- <prompt>`,
+		command: `${[command, ...args.slice(0, -2)].join(" ")} -- <prompt>`,
 		cwd,
 		exitCode: result.code,
 		signal: result.sig,
@@ -319,6 +260,9 @@ async function runNanoAgent(
 
 	if (result.aborted) {
 		return { text: `${TOOL_NAME}: aborted by the user.`, details };
+	}
+	if (spawnFailed) {
+		return { text: `${TOOL_NAME}: could not start ${command}.${details.stderr ? `\n\n${details.stderr}` : ""}`, details };
 	}
 	if (result.code !== 0) {
 		const parts = [`${TOOL_NAME}: subagent exited with code ${result.code ?? "null"}.`];

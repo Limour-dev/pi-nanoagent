@@ -50,17 +50,18 @@ is aborted.
 ### Finding the pi executable
 
 The parent process is **not** always the pi CLI: hosts like [pi-web](https://github.com/Limour-dev/pi-web)
-run pi in-process, so `process.argv[1]` there is Next.js' own bin (which also
-has a `-p, --port`). Candidates are therefore checked before use, in order:
+run pi in-process, so `process.argv[1]` there is Next.js' own bin — which also
+takes `-p, --port`, so relaunching it as if it were pi fails. The CLI is
+therefore found from exactly two sources, both statically (nothing is ever
+executed just to test a candidate):
 
-1. `PI_CLI` env var — explicit override, always trusted.
-2. `process.argv[1]` (or `process.execPath` for a standalone pi binary).
-3. `pi` on `PATH`.
+1. `PI_CLI` env var — explicit override.
+2. `pi` on `PATH`, preferring a candidate whose real path contains
+   `pi-coding-agent` if your `PATH` holds an unrelated `pi`.
 
-A candidate in a known pi layout (its real path contains `pi-coding-agent`) is
-accepted as-is; any other candidate must answer `--help` with pi's flags before
-it is executed. Resolution happens once per pi process and is shared by all
-concurrent calls. If nothing qualifies, the error lists what was tried.
+Resolution is memoized once per pi process. If nothing is found the tool says
+so and tells you to set `PI_CLI`; if the chosen executable cannot be started,
+the error names it.
 
 Because only `bash` survives, the subagent must do everything through the shell
 — which is the point: a cheap, disposable, single-tool worker.
