@@ -4,9 +4,11 @@
  * One call = one fresh `pi` process in `-p` (print) mode, isolated from the
  * current conversation:
  *
- *   pi -p --no-session --no-extensions --no-skills --tools bash -- <prompt>
+ *   pi -p --no-session --no-extensions --no-skills \
+ *     -e <pi-trace-id> --tools bash -- <prompt>
  *
- * That is: no skills, no extensions (this plugin included), and exactly one
+ * That is: no skills, no discovered extensions (this plugin included), the
+ * pi-trace-id tracing extension loaded explicitly, and exactly one
  * tool — `bash`. The child inherits the dispatching session's cwd, model and
  * thinking level, and is killed when the parent turn is aborted. The CLI is
  * found via `PI_CLI` or as `pi` on PATH — never via `process.argv[1]`, which is
@@ -31,7 +33,7 @@ const KILL_GRACE_MS = 5_000;
 // System-prompt surface (kept deliberately small)
 // ---------------------------------------------------------------------------
 
-const DESCRIPTION = `Run one self-contained task in a fresh, isolated pi subagent ("nano agent"): empty context, no skills, no extensions, and only the bash tool. Give it the full task in prompt — it cannot read files except through the shell. Independent tasks may be dispatched in parallel. Returns the subagent's stdout.`;
+const DESCRIPTION = `Run one self-contained task in a fresh, isolated pi subagent ("nano agent"): empty context, no skills, no other extensions, and only the bash tool. Give it the full task in prompt — it cannot read files except through the shell. Independent tasks may be dispatched in parallel. Returns the subagent's stdout.`;
 
 const PROMPT_SNIPPET = "Delegate a self-contained task to a fresh bash-only subagent";
 
@@ -52,6 +54,7 @@ type Params = Static<typeof ParamsSchema>;
 interface NanoDetails {
 	command: string;
 	cwd: string;
+	extensions: string[];
 	exitCode: number | null;
 	signal: NodeJS.Signals | null;
 	aborted: boolean;
@@ -150,15 +153,144 @@ function resolvePiCli(): string {
 	throw new Error("could not find the pi CLI on PATH. Set PI_CLI to the pi executable.");
 }
 
+// ---------------------------------------------------------------------------
+// Explicitly permitted extensions
+// ---------------------------------------------------------------------------
+
+/*
+ * `--no-extensions` kills discovery, but explicit `-e` paths still load. That
+ * escape hatch is used for exactly one package: pi-trace-id, which stamps
+ * AH-Thread-Id / AH-Trace-Id on the child's provider requests. It registers no
+ * tools, so `--tools bash` stays a complete description of what the child can
+ * do. The child keeps its own ephemeral session id, so its AH-Trace-Id is a
+ * fresh trace (the AH-Thread-Id still matches the parent: same cwd).
+ *
+ * PI_NANO_EXTENSIONS overrides the search with a path list, for installs that
+ * do not live under a standard pi package root.
+ */
+const PERMITTED_EXTENSIONS = ["pi-trace-id"];
+const EXTRA_EXTENSIONS_ENV = "PI_NANO_EXTENSIONS";
+const PACKAGE_SEARCH_DEPTH = 3;
+
+function isDir(p: string): boolean {
+	try {
+		return fs.statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** A path pi can load with `-e`: a package directory, or a single extension file. */
+function asLoadablePath(dir: string): string | undefined {
+	try {
+		const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf-8")) as {
+			pi?: { extensions?: unknown };
+		};
+		if (Array.isArray(pkg.pi?.extensions)) return dir; // pi resolves the manifest itself
+	} catch {
+		// no package.json (or unreadable): fall through to conventional layouts
+	}
+	if (isDir(path.join(dir, "extensions"))) return dir;
+	for (const name of ["index.ts", `${path.basename(dir)}.ts`]) {
+		const file = path.join(dir, name);
+		if (fs.existsSync(file)) return file;
+	}
+	return undefined;
+}
+
+/** Breadth-first search for a directory named `name` under `root`. */
+function findDir(root: string, name: string): string | undefined {
+	const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+	while (queue.length > 0) {
+		const { dir, depth } = queue.shift()!;
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (entry.name !== name) continue;
+			const loadable = asLoadablePath(path.join(dir, entry.name));
+			if (loadable) return loadable;
+		}
+		if (depth >= PACKAGE_SEARCH_DEPTH) continue;
+		for (const entry of entries) {
+			if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
+			queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+		}
+	}
+	return undefined;
+}
+
+/** Package roots, project scope first — pi gives project settings precedence too. */
+function packageRoots(cwd: string): string[] {
+	const config = process.env.PI_CODING_AGENT_DIR?.trim();
+	const agentDir =
+		config || path.join(process.env.HOME ?? process.env.USERPROFILE ?? "", ".pi", "agent");
+	return [
+		path.join(cwd, ".pi", "git"),
+		path.join(cwd, ".pi", "npm", "node_modules"),
+		path.join(agentDir, "git"),
+		path.join(agentDir, "npm", "node_modules"),
+	];
+}
+
+function findExtension(cwd: string, name: string): string | undefined {
+	for (const root of packageRoots(cwd)) {
+		if (path.basename(root) === "node_modules") {
+			const full = path.join(root, name); // npm packages sit directly in node_modules
+			if (isDir(full)) return asLoadablePath(full);
+			continue;
+		}
+		const loadable = findDir(root, name);
+		if (loadable) return loadable;
+	}
+	return undefined;
+}
+
+let permittedExtensionArgs: string[] | undefined;
+
+/** `-e` arguments for the child, resolved once per pi process. */
+function resolveExtensions(cwd: string): string[] {
+	if (permittedExtensionArgs) return permittedExtensionArgs;
+
+	const override = process.env[EXTRA_EXTENSIONS_ENV]?.trim();
+	if (override) {
+		return (permittedExtensionArgs = override
+			.split(/[;,\n]/) // not path.delimiter: it splits `npm:foo` on posix
+			.map((entry) => entry.trim())
+			.filter((entry) => entry !== "")
+			.map((entry) => {
+				const full = path.resolve(cwd, entry);
+				if (!fs.existsSync(full)) return entry; // let pi interpret sources like npm:foo
+				return isDir(full) ? (asLoadablePath(full) ?? full) : full;
+			}));
+	}
+
+	const found: string[] = [];
+	for (const name of PERMITTED_EXTENSIONS) {
+		const loadable = findExtension(cwd, name);
+		if (loadable) found.push(loadable);
+	}
+	return (permittedExtensionArgs = found);
+}
+
 function buildArgs(ctx: ExtensionContext, prompt: string): string[] {
 	const args = [
 		"-p", // print mode: run once, print, exit
 		"--no-session", // ephemeral: never touches session storage
-		"--no-extensions", // no plugin discovery (this plugin is left out too)
+		"--no-extensions", // no extension discovery (this plugin is left out too)
 		"--no-skills", // no skills discovery/loading
-		"--tools",
-		"bash", // allowlist: bash is the only tool the child gets
 	];
+
+	// Discovery is off, but explicit `-e` paths still load: tracing survives.
+	for (const ext of resolveExtensions(ctx.cwd)) args.push("-e", ext);
+
+	// Allowlist: bash is the only tool the child gets — extension tools are
+	// filtered by it too, and the permitted extensions register none.
+	args.push("--tools", "bash");
 
 	const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 	if (model) args.push("--model", model);
@@ -249,6 +381,7 @@ async function runNanoAgent(
 		// Drop `--` and the (possibly huge) prompt: show it as `<prompt>` instead.
 		command: `${[command, ...args.slice(0, -2)].join(" ")} -- <prompt>`,
 		cwd,
+		extensions: resolveExtensions(cwd),
 		exitCode: result.code,
 		signal: result.sig,
 		aborted: result.aborted,

@@ -1,10 +1,12 @@
 # pi-nanoagent
 
 A `nano_agent` tool for [Pi](https://github.com/badlogic/pi-mono): every call
-spawns a **fresh, isolated `pi` process** with no skills, no extensions and
-exactly one tool — `bash`. At most **4 run in parallel**.
+spawns a **fresh, isolated `pi` process** with no skills, no discovered
+extensions and exactly one tool — `bash`. One extension is deliberately let
+back in: the [`pi-trace-id` tracer](#tracing-extension). At most **4 run in
+parallel**.
 
-Designed to be minimal — one ~250-line TypeScript file, no dependencies to
+Designed to be minimal — one ~450-line TypeScript file, no dependencies to
 install (uses only what Pi already provides), and a deliberately small
 system-prompt footprint.
 
@@ -27,6 +29,7 @@ pi -p \
   --no-session \
   --no-extensions \
   --no-skills \
+  -e <pi-trace-id> \
   --tools bash \
   --model <parent provider/id> \
   --thinking <parent level> \
@@ -37,7 +40,8 @@ pi -p \
 |------|--------|
 | `-p` | Print mode: run once, print stdout, exit. No state kept. |
 | `--no-session` | Ephemeral — the child never writes a session file. |
-| `--no-extensions` | Extension/plugin discovery is off, so this tool is not available to the child either (no recursion). |
+| `--no-extensions` | Extension/plugin discovery is off, so this tool is not available to the child either (no recursion) and no other plugin can sneak in. |
+| `-e <pi-trace-id>` | Explicit path to the tracing extension. Discovery stays off — `-e` bypasses it — so this is the only extension the child loads. |
 | `--no-skills` | Skill discovery and loading is off. |
 | `--tools bash` | Allowlist — `bash` is the **only** tool. `read`, `write`, `edit`, `grep`, `ls`, … are all gone. |
 | `--model` / `--thinking` | Inherited from the dispatching session (`ctx.model`, `ctx.thinkingLevel`). |
@@ -66,6 +70,34 @@ the error names it.
 Because only `bash` survives, the subagent must do everything through the shell
 — which is the point: a cheap, disposable, single-tool worker.
 
+## Tracing extension
+
+`--no-extensions` disables *discovery*, but explicit `-e` paths still load. That
+escape hatch is used for exactly one package: `pi-trace-id`, which stamps
+`AH-Thread-Id` / `AH-Trace-Id` on every provider request the child makes. It
+registers no tools, so `--tools bash` stays a complete description of what the
+subagent can do.
+
+- **Resolution** is static and memoized once per pi process — nothing is ever
+  executed to find it. The package is looked up by directory name, project
+  scope first: `<cwd>/.pi/git/**`, `<cwd>/.pi/npm/node_modules`,
+  `$PI_CODING_AGENT_DIR` (default `~/.pi/agent`) `git/**`, then
+  `npm/node_modules`. What is found is passed as `-e <path>`; a package
+  directory is fine, pi reads its manifest.
+- **Not installed?** The child simply runs without tracing; nothing else
+  changes. `details.extensions` lists what was actually loaded.
+- **`AH-Thread-Id`** hashes the cwd, so it equals the parent's thread id — the
+  child runs in the parent's cwd.
+- **`AH-Trace-Id`** is the child's *own* ephemeral session id (rewritten to a
+  v4 UUID) because the child runs with `--no-session`: every `nano_agent` call
+  is its own trace within the parent's thread.
+- **Override** the search with `PI_NANO_EXTENSIONS` — a path list separated by
+  `;`, `,` or newlines, for installs outside the standard package roots:
+
+  ```bash
+  PI_NANO_EXTENSIONS=/home/me/pi-trace-id pi
+  ```
+
 ## Tool contract
 
 ```jsonc
@@ -79,7 +111,8 @@ conversation history**, so the prompt must be self-contained: include the
 context, the expected output format, and any working-directory assumptions.
 
 Result: the subagent's trimmed stdout as text. Tool `details` carry the exit
-code, signal, wall-clock duration, whether stdout was truncated, and stderr.
+code, signal, wall-clock duration, whether stdout was truncated, the extension
+paths actually loaded, and stderr.
 
 On failure the tool returns diagnostics instead of stdout:
 
@@ -106,7 +139,7 @@ not a hard limit. Output is capped at
 - One-shot: no back-and-forth with the subagent, no session to resume.
 - `bash` only: the child cannot use structured `read`/`edit`/`write` tools.
 - No hard timeout; only the parent abort signal stops a runaway child.
-- Nested delegation is impossible by construction (`--no-extensions`).
+- Nested delegation is impossible by construction (`--no-extensions`, and `pi-nanoagent` is not on the permit list).
 
 ## License
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-nanoagent",
   "version": "1.0.0",
-  "description": "A single nano_agent tool for Pi: delegate one self-contained task to a fresh, isolated pi process that has no skills, no extensions and only the bash tool. Up to 4 run in parallel.",
+  "description": "A single nano_agent tool for Pi: delegate one self-contained task to a fresh, isolated pi process that has no skills, no discovered extensions (only the pi-trace-id tracer), and only the bash tool. Up to 4 run in parallel.",
   "keywords": ["pi-package"],
   "license": "GPL-3.0-or-later",
   "type": "module",
