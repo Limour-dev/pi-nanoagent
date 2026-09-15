@@ -47,6 +47,21 @@ The child runs in the parent's `cwd`, inherits the environment (including
 `PI_*`), and is killed (`SIGTERM`, then `SIGKILL` after 5s) when the parent turn
 is aborted.
 
+### Finding the pi executable
+
+The parent process is **not** always the pi CLI: hosts like [pi-web](https://github.com/Limour-dev/pi-web)
+run pi in-process, so `process.argv[1]` there is Next.js' own bin (which also
+has a `-p, --port`). Candidates are therefore checked before use, in order:
+
+1. `PI_CLI` env var — explicit override, always trusted.
+2. `process.argv[1]` (or `process.execPath` for a standalone pi binary).
+3. `pi` on `PATH`.
+
+A candidate in a known pi layout (its real path contains `pi-coding-agent`) is
+accepted as-is; any other candidate must answer `--help` with pi's flags before
+it is executed. Resolution happens once per pi process and is shared by all
+concurrent calls. If nothing qualifies, the error lists what was tried.
+
 Because only `bash` survives, the subagent must do everything through the shell
 — which is the point: a cheap, disposable, single-tool worker.
 

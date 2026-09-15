@@ -8,7 +8,9 @@
  *
  * That is: no skills, no extensions (this plugin included), and exactly one
  * tool — `bash`. The child inherits the dispatching session's cwd, model and
- * thinking level, and is killed when the parent turn is aborted.
+ * thinking level, and is killed when the parent turn is aborted. The pi
+ * executable is discovered defensively (hosts such as pi-web run pi in-process,
+ * so `process.argv[1]` there is not the CLI); `PI_CLI` overrides the search.
  *
  * At most 4 children run at the same time; extra calls queue until a slot is
  * free. No dependencies beyond what Pi already provides.
@@ -24,6 +26,7 @@ const MAX_PARALLEL = 4;
 const OUTPUT_LIMIT = 50 * 1024; // stdout kept for the model, tail-biased
 const STDERR_LIMIT = 8 * 1024;
 const KILL_GRACE_MS = 5_000;
+const PROBE_TIMEOUT_MS = 20_000;
 
 // ---------------------------------------------------------------------------
 // System-prompt surface (kept deliberately small)
@@ -98,19 +101,114 @@ function releaseSlot(): void {
 // Child process invocation
 // ---------------------------------------------------------------------------
 
-function getPiInvocation(): { command: string; args: string[] } {
+interface Invocation {
+	command: string;
+	args: string[];
+}
+
+interface Candidate {
+	inv: Invocation;
+	/** Known to be the pi CLI, so it wins without being executed. */
+	trusted: boolean;
+}
+
+const PI_CLI_MARKER = "pi-coding-agent";
+const PI_HELP_FLAGS = ["--append-system-prompt", "--no-prompt-templates", "--thinking"];
+
+function realpathOf(p: string): string {
+	try {
+		return fs.realpathSync(p);
+	} catch {
+		return p;
+	}
+}
+
+function findOnPath(name: string): string | undefined {
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		if (!dir) continue;
+		const full = path.join(dir, name);
+		try {
+			fs.accessSync(full, fs.constants.X_OK);
+			return full;
+		} catch {
+			// keep looking
+		}
+	}
+	return undefined;
+}
+
+// The parent process is NOT always the pi CLI: hosts such as pi-web run pi
+// in-process, so argv[1] there is Next.js' own bin (which has its own -p, --port).
+// Candidates in a known pi layout are accepted as-is; anything else must prove
+// itself via `--help` before we are willing to execute it.
+function candidates(): Candidate[] {
+	const list: Candidate[] = [];
+	const push = (command: string, args: string[], trusted: boolean) => list.push({ inv: { command, args }, trusted });
+
+	const override = process.env.PI_CLI?.trim();
+	if (override) push(override, [], true); // explicit user choice
+
 	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript] };
+	if (currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)) {
+		push(process.execPath, [currentScript], realpathOf(currentScript).includes(PI_CLI_MARKER));
 	}
 
-	const execName = path.basename(process.execPath).toLowerCase();
-	if (!/^(node|bun)(\.exe)?$/.test(execName)) {
-		return { command: process.execPath, args: [] };
+	// A standalone (bun-compiled) pi binary is its own executable.
+	if (!/^(node|bun)(\.exe)?$/.test(path.basename(process.execPath).toLowerCase())) {
+		push(process.execPath, [], realpathOf(process.execPath).includes(PI_CLI_MARKER));
 	}
 
-	return { command: "pi", args: [] };
+	const onPath = findOnPath("pi");
+	if (onPath) push(onPath, [], realpathOf(onPath).includes(PI_CLI_MARKER));
+	return list;
+}
+
+/** The pi CLI's `--help` is the only one carrying all of these flags. */
+async function isPiCli(inv: Invocation): Promise<boolean> {
+	return await new Promise<boolean>((resolve) => {
+		let out = "";
+		let settled = false;
+		let timer: NodeJS.Timeout | undefined;
+		const finish = (ok: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			resolve(ok);
+		};
+
+		const proc = spawn(inv.command, [...inv.args, "--help"], { stdio: ["ignore", "pipe", "ignore"], shell: false });
+		timer = setTimeout(() => {
+			proc.kill("SIGKILL");
+			finish(false);
+		}, PROBE_TIMEOUT_MS);
+		timer.unref?.();
+
+		proc.stdout?.setEncoding("utf-8");
+		proc.stdout?.on("data", (chunk: string) => {
+			out += chunk;
+		});
+		proc.on("error", () => finish(false));
+		proc.on("close", () => finish(PI_HELP_FLAGS.every((flag) => out.includes(flag))));
+	});
+}
+
+let invocationPromise: Promise<Invocation> | undefined;
+
+/** Resolved once per pi process, then reused by concurrent calls. */
+function resolveInvocation(): Promise<Invocation> {
+	invocationPromise ??= (async () => {
+		const list = candidates();
+		for (const { inv, trusted } of list) {
+			if (trusted) return inv;
+		}
+		for (const { inv } of list) {
+			if (await isPiCli(inv)) return inv;
+		}
+		throw new Error(
+			`could not find the pi CLI (tried: ${list.map((c) => c.inv.command).join(", ") || "nothing"}). Set PI_CLI to the pi executable.`,
+		);
+	})();
+	return invocationPromise;
 }
 
 function buildArgs(ctx: ExtensionContext, prompt: string): string[] {
@@ -149,7 +247,7 @@ async function runNanoAgent(
 	prompt: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ text: string; details: NanoDetails }> {
-	const invocation = getPiInvocation();
+	const invocation = await resolveInvocation();
 	const args = buildArgs(ctx, prompt);
 	const cwd = ctx.cwd;
 	const startedAt = Date.now();
